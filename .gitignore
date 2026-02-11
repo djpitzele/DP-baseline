@@ -187,3 +187,4 @@ ignores/
 
 # data ignores
 joints_50demos/
+joints_50demos_replay.zarr/
