@@ -184,3 +184,6 @@ toy2.py
 lightning_logs/
 run.sh
 ignores/
+
+# data ignores
+joints_50demos/
