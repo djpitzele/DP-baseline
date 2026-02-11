@@ -141,7 +141,7 @@ class ReplayBuffer:
         Open an on-disk zarr directly (for dataset larger than memory).
         Slower.
         """
-        group = zarr.open(os.path.expanduser(zarr_path), mode)
+        group = zarr.open(os.path.expanduser(zarr_path), mode=mode)
         return cls.create_from_group(group, **kwargs)
 
     # ============= copy constructors ===============
@@ -221,7 +221,25 @@ class ReplayBuffer:
         if backend == 'numpy':
             print('backend argument is deprecated!')
             store = None
-        group = zarr.open(os.path.expanduser(zarr_path), 'r')
+        group = zarr.open(os.path.expanduser(zarr_path), mode='r')
+        # When loading to numpy (store=None), read directly from the opened group
+        # to avoid zarr.group(read_only_store) defaulting to mode='a' in zarr 3.x
+        if store is None:
+            meta = dict()
+            for key in group['meta'].keys():
+                value = group['meta'][key]
+                if hasattr(value, 'shape') and len(value.shape) == 0:
+                    meta[key] = np.array(value)
+                else:
+                    meta[key] = value[:] if hasattr(value, '__getitem__') else np.array(value)
+            if keys is None:
+                keys = list(group['data'].keys())
+            data = dict()
+            for key in keys:
+                arr = group['data'][key]
+                data[key] = arr[:]
+            root = {'meta': meta, 'data': data}
+            return cls(root=root)
         return cls.copy_from_store(src_store=group.store, store=store,
                                    keys=keys, chunks=chunks, compressors=compressors,
                                    if_exists=if_exists, **kwargs)

@@ -1,0 +1,49 @@
+pipeline_name: dp_joints_image
+env_name: joints-image-v0
+abs_action: false
+dataset_path: joints_50demos_replay.zarr
+mode: train
+obs_keys: ['img', 'action']
+# Input image shape (from zarr/dataset before condition resize/crop)
+shape_meta:
+  obs:
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+action_dim: 8
+obs_steps: 2
+action_steps: 8
+# obs_encoder (input images resized/cropped to match)
+rgb_model: resnet18
+resize_shape: [96, 96]
+crop_shape: [84, 84]
+random_crop: true
+use_group_norm: true
+use_seq: true
+# train
+device: cuda:0
+seed: 0
+gradient_steps: 1000000
+batch_size: 32
+horizon: 16
+nn: dit
+diffusion: ddpm
+sample_steps: 5
+lr: 0.0001
+model_path: path/to/model
+num_workers: 4
+eval_freq: 100000
+save_freq: 100000
+# log
+exp_name: joints_${nn}_${diffusion}_horizon_${horizon}
+save_path: logs
+project: CleanDiffuser
+group: dp_joints
+wandb_mode: offline
+log_freq: 500
+work_dir: ${save_path}/${pipeline_name}/${mode}/${env_name}/${exp_name}_${now:%Y%m%d_%H%M%S}/${seed}
+hydra:
+  run:
+    dir: ${work_dir}
+  job:
+    chdir: false

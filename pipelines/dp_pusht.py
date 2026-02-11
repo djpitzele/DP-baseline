@@ -242,7 +242,7 @@ def pipeline(args):
             if n_gradient_step % args.save_freq == 0:
                 logger.save_agent(agent=agent, identifier=n_gradient_step)
                 
-            if n_gradient_step % args.eval_freq == 0:
+            if n_gradient_step > 0 and n_gradient_step % args.eval_freq == 0:
                 print("Evaluate model...")
                 agent.model.eval()
                 agent.model_ema.eval()
