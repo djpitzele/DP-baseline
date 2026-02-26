@@ -17,6 +17,14 @@ shape_meta:
 action_dim: 8
 obs_steps: 2
 action_steps: 8
+# Image augmentations (applied to all RGB obs). Add more dicts to extend.
+# Each dict: name + kwargs. Supported: color_jitter, random_grayscale.
+image_augmentations:
+  - name: color_jitter
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
 # obs_encoder (input images resized/cropped to match)
 rgb_model: resnet18
 resize_shape: [96, 96]

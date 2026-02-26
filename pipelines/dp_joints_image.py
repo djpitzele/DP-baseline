@@ -45,6 +45,7 @@ def pipeline(args):
         pad_before=args.obs_steps - 1,
         pad_after=args.action_steps - 1,
         abs_action=args.abs_action,
+        image_augmentations=getattr(args, "image_augmentations", None),
     )
     print(dataset)
     dataloader = torch.utils.data.DataLoader(
