@@ -1,8 +1,9 @@
 """
 Dataset for joints_50demos-style data: RGB images as observation, joint angles (+ gripper) as action.
-Zarr must have keys: img (N, H, W, 3), action (N, action_dim).
+Zarr must have keys: img (N, H, W, 3), action (N, action_dim) for single-cam;
+  or img_cam0 (N, H, W, 3), img_cam1 (N, H, W, 3), action (N, action_dim) for dual-cam (scene + wrist).
 """
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -17,8 +18,19 @@ from cleandiffuser.dataset.dataset_utils import (
 )
 
 
+def _image_zarr_to_obs_key(zarr_key: str) -> str:
+    """Map zarr image key to obs key used in shape_meta / condition."""
+    if zarr_key == "img":
+        return "image"
+    if zarr_key.startswith("img_"):
+        return "image_" + zarr_key[4:]
+    return zarr_key
+
+
 class JointsImageDataset(BaseDataset):
-    """RGB images -> joint actions. No low-dim state (e.g. no agent_pos)."""
+    """RGB images -> joint actions. No low-dim state (e.g. no agent_pos).
+    Supports single-cam (img) or dual-cam (img_cam0, img_cam1) from rgb_cam0 / rgb_cam1 folders.
+    """
 
     def __init__(
         self,
@@ -30,6 +42,7 @@ class JointsImageDataset(BaseDataset):
         abs_action=False,
     ):
         super().__init__()
+        self.obs_keys = list(obs_keys)
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=list(obs_keys))
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -40,15 +53,20 @@ class JointsImageDataset(BaseDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self._image_zarr_keys = [
+            k for k in self.obs_keys
+            if k == "img" or (k.startswith("img_") and k != "action")
+        ]
         self.normalizer = self.get_normalizer()
 
     def get_normalizer(self):
-        image_normalizer = ImageNormalizer()
         action_normalizer = MinMaxNormalizer(self.replay_buffer["action"][:])
+        obs_normalizers = {}
+        for zarr_key in self._image_zarr_keys:
+            obs_key = _image_zarr_to_obs_key(zarr_key)
+            obs_normalizers[obs_key] = ImageNormalizer()
         return {
-            "obs": {
-                "image": image_normalizer,
-            },
+            "obs": obs_normalizers,
             "action": action_normalizer,
         }
 
@@ -62,15 +80,17 @@ class JointsImageDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        # image: (T, H, W, C) -> (T, C, H, W), [0,255] -> [0,1], then normalize
-        image = np.moveaxis(sample["img"], -1, 1).astype(np.float32) / 255.0
-        image = self.normalizer["obs"]["image"].normalize(image)
+        # Each image: (T, H, W, C) -> (T, C, H, W), [0,255] -> [0,1], then normalize
+        obs = {}
+        for zarr_key in self._image_zarr_keys:
+            obs_key = _image_zarr_to_obs_key(zarr_key)
+            image = np.moveaxis(sample[zarr_key], -1, 1).astype(np.float32) / 255.0
+            image = self.normalizer["obs"][obs_key].normalize(image)
+            obs[obs_key] = image
         action = sample["action"].astype(np.float32)
         action = self.normalizer["action"].normalize(action)
         data = {
-            "obs": {
-                "image": image,
-            },
+            "obs": obs,
             "action": action,
         }
         return data

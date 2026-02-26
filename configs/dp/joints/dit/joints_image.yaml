@@ -3,11 +3,15 @@ env_name: joints-image-v0
 abs_action: false
 dataset_path: joints_50demos_replay.zarr
 mode: train
-obs_keys: ['img', 'action']
+# Single-cam: ['img', 'action']. Dual-cam (scene + wrist): ['img_cam0', 'img_cam1', 'action']
+obs_keys: ['img_cam0', 'img_cam1', 'action']
 # Input image shape (from zarr/dataset before condition resize/crop)
 shape_meta:
   obs:
-    image:
+    image_cam0:
+      shape: [3, 96, 96]
+      type: rgb
+    image_cam1:
       shape: [3, 96, 96]
       type: rgb
 action_dim: 8
