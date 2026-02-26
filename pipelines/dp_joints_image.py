@@ -192,6 +192,14 @@ def pipeline(args):
 
             if n_gradient_step % args.save_freq == 0:
                 logger.save_agent(agent=agent, identifier=n_gradient_step)
+                # Save action normalizer stats for inference-time unnormalization
+                stats_path = logger._model_dir / f"action_normalizer_stats_{n_gradient_step}.npz"
+                np.savez(
+                    stats_path,
+                    min=dataset.normalizer["action"].min,
+                    max=dataset.normalizer["action"].max,
+                )
+                print(f"Action normalizer stats saved to {stats_path}")
 
             if envs is not None and n_gradient_step > 0 and n_gradient_step % args.eval_freq == 0:
                 print("Evaluate model...")
@@ -203,8 +211,29 @@ def pipeline(args):
 
             n_gradient_step += 1
             if n_gradient_step >= args.gradient_steps:
+                # Save final action normalizer stats (for model_final.pt)
+                final_stats_path = logger._model_dir / "action_normalizer_stats_final.npz"
+                np.savez(
+                    final_stats_path,
+                    min=dataset.normalizer["action"].min,
+                    max=dataset.normalizer["action"].max,
+                )
+                print(f"Action normalizer stats (final) saved to {final_stats_path}")
                 logger.finish(agent)
                 break
+
+        # Save the FULL version of the model using torch.save
+        full_model_path = os.path.join(args.work_dir, "agent_full.pth")
+        torch.save(agent, full_model_path)
+        print(f"Full agent model saved to {full_model_path}")
+        # Save action normalizer stats next to full model for inference
+        full_stats_path = os.path.join(args.work_dir, "action_normalizer_stats.npz")
+        np.savez(
+            full_stats_path,
+            min=dataset.normalizer["action"].min,
+            max=dataset.normalizer["action"].max,
+        )
+        print(f"Action normalizer stats saved to {full_stats_path}")
 
     elif args.mode == "inference":
         if args.model_path:
@@ -217,6 +246,34 @@ def pipeline(args):
             # inference(args, envs, dataset, agent, logger)
             pass
         print("No env for joints-image; skipping rollout.")
+
+        # -------------------------------------------------------------------------
+        # Action unnormalization at inference
+        # -------------------------------------------------------------------------
+        # The policy outputs actions in normalized space [-1, 1]. You must
+        # unnormalize to get absolute joint angles (rad) and gripper before
+        # sending to the robot.
+        #
+        # 1) Load the stats saved during training (same identifier as the model):
+        #    import numpy as np
+        #    stats = np.load("path/to/action_normalizer_stats.npz")  # or action_normalizer_stats_final.npz / action_normalizer_stats_<step>.npz
+        #    action_min = stats["min"]   # shape (action_dim,)
+        #    action_max = stats["max"]   # shape (action_dim,)
+        #    action_range = action_max - action_min
+        #
+        # 2) After sampling from the policy you get naction in [-1, 1]:
+        #    naction, _ = agent.sample(prior=prior, n_samples=1, sample_steps=args.sample_steps, solver=solver, condition_cfg=condition, w_cfg=1.0, use_ema=True)
+        #    naction = naction.detach().cpu().numpy()   # (1, horizon, action_dim)
+        #
+        # 3) Unnormalize to raw scale (absolute joint angles + gripper):
+        #    action_raw = (naction + 1.0) / 2.0 * action_range + action_min
+        #
+        # 4) Use the first action step (or chunk of action_steps) for the robot:
+        #    start = 0
+        #    end = start + args.action_steps
+        #    action = action_raw[:, start:end, :]   # (1, action_steps, action_dim)
+        #    # Then e.g. action[0, 0, :] for the next commanded pose.
+        # -------------------------------------------------------------------------
     else:
         raise ValueError("Illegal mode")
 
