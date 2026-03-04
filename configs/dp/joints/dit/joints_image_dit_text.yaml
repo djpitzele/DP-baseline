@@ -1,0 +1,9 @@
+# DiT + text conditioning variant: same as joints_image but with text instruction.
+# Use with: python pipelines/dp_joints_image_dit_text.py
+defaults:
+  - joints_image
+
+pipeline_name: dp_joints_image_dit_text
+exp_name: joints_dit_text_${diffusion}_horizon_${horizon}
+# Text embedding dimension before projecting to condition dim
+text_emb_dim: 64

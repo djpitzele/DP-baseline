@@ -1,7 +1,7 @@
 pipeline_name: dp_joints_image
 env_name: joints-image-v0
 abs_action: false
-dataset_path: joints_50demos_replay.zarr
+dataset_path: data/joints_50demos_replay.zarr
 mode: train
 # Single-cam: ['img', 'action']. Dual-cam (scene + wrist): ['img_cam0', 'img_cam1', 'action']
 obs_keys: ['img_cam0', 'img_cam1', 'action']
