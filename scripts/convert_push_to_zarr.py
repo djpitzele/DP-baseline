@@ -1,16 +1,13 @@
 """
-Convert a raw push_100demos-style dataset into a ReplayBuffer zarr.
+Convert a raw push dataset (video format) into a ReplayBuffer zarr.
 
 Expected input directory structure (per episode):
 
-    data/push_100demos/
+    data/0309_push_150demos/
         run_YYYYMMDD_HHMMSS/
-            rgb_cam0/
-                *.png
-            rgb_cam1/
-                *.png
-            joint_trajectory/
-                trajectory_joints.npz
+            cam0.mp4
+            cam1.mp4
+            trajectory_joints.npz
 
 This script creates a zarr directory that is compatible with
 cleandiffuser.dataset.joints_dataset.JointsImageDataset for the dual-camera
@@ -21,11 +18,14 @@ setting, with the following zarr keys:
     /data/action    -> (N, action_dim) float32
     /meta/episode_ends -> (E,) int64 cumulative step counts
 
+Requires imageio with the FFMPEG backend:
+    pip install imageio[ffmpeg]
+
 Run from the repository root (DP-baseline), for example:
 
     python scripts/convert_push_to_zarr.py \\
-        --input_dir data/push_100demos \\
-        --output_path data/joints_50demos_replay.zarr
+        --input_dir data/0309_push_150demos \\
+        --output_path data/joints_150demos_replay.zarr
 
 You can then point configs like configs/dp/joints/dit/joints_image.yaml
 to the produced zarr via dataset_path.
@@ -40,6 +40,7 @@ from typing import List, Tuple
 import numpy as np
 from PIL import Image
 
+import imageio.v3 as iio
 import zarr
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,13 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="data/push_100demos",
+        default="data/0309_push_150demos",
         help="Path to folder containing run_* episode directories.",
     )
     parser.add_argument(
         "--output_path",
         type=str,
-        default="data/joints_50demos_replay.zarr",
+        default="data/joints_150demos_replay.zarr",
         help="Path to output zarr directory (will be created).",
     )
     parser.add_argument(
@@ -117,8 +118,7 @@ def enumerate_episodes(input_dir: str) -> List[str]:
 
 
 def load_action_array(run_dir: str) -> np.ndarray:
-    traj_dir = os.path.join(run_dir, "joint_trajectory")
-    npz_path = os.path.join(traj_dir, "trajectory_joints.npz")
+    npz_path = os.path.join(run_dir, "trajectory_joints.npz")
     if not os.path.exists(npz_path):
         raise FileNotFoundError(f"Missing trajectory file: {npz_path}")
     data = np.load(npz_path)
@@ -165,42 +165,47 @@ def load_action_array(run_dir: str) -> np.ndarray:
     return action
 
 
-def list_camera_frames(run_dir: str, cam_subdir: str) -> List[str]:
-    cam_dir = os.path.join(run_dir, cam_subdir)
-    if not os.path.isdir(cam_dir):
-        raise FileNotFoundError(f"Missing camera directory: {cam_dir}")
-    files = [
-        os.path.join(cam_dir, f)
-        for f in os.listdir(cam_dir)
-        if f.lower().endswith(".png")
-    ]
-    files.sort()
-    if not files:
-        raise ValueError(f"No PNG frames found in {cam_dir}")
-    return files
+def subsample_to_length(arr: np.ndarray, T: int) -> np.ndarray:
+    """Return arr subsampled to exactly T steps along axis 0.
+
+    Indices are chosen with np.linspace so that dropped entries are spread
+    evenly across the full sequence rather than all removed from the end.
+    If arr already has T steps it is returned unchanged.
+    """
+    if arr.shape[0] == T:
+        return arr
+    indices = np.round(np.linspace(0, arr.shape[0] - 1, T)).astype(int)
+    return arr[indices]
 
 
-def load_frames(
-    frame_paths: List[str],
+def load_video_frames(
+    run_dir: str,
+    cam_name: str,
     resize_hw: Tuple[int, int],
 ) -> np.ndarray:
+    """Decode all frames from a .mp4 video file and return as (T, H, W, 3) uint8."""
+    video_path = os.path.join(run_dir, f"{cam_name}.mp4")
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Missing video file: {video_path}")
+
+    # iio.imread with index=None reads all frames as (T, H, W, C)
+    frames = iio.imread(video_path, plugin="FFMPEG", index=None)
+
+    if frames.ndim != 4 or frames.shape[3] != 3:
+        raise ValueError(
+            f"Unexpected video frame shape {frames.shape} from {video_path}"
+        )
+
     H, W = resize_hw
-    T = len(frame_paths)
-    imgs = np.empty((T, H, W, 3), dtype=np.uint8)
-    for i, path in enumerate(frame_paths):
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            if (im.height, im.width) != (H, W):
-                im = im.resize((W, H), resample=Image.BILINEAR)
-            arr = np.array(im, dtype=np.uint8)
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            raise ValueError(f"Unexpected image shape {arr.shape} for {path}")
-        if arr.shape[0] != H or arr.shape[1] != W:
-            # Just in case, enforce shape via resize.
-            im = Image.fromarray(arr).resize((W, H), resample=Image.BILINEAR)
-            arr = np.array(im, dtype=np.uint8)
-        imgs[i] = arr
-    return imgs
+    if (frames.shape[1], frames.shape[2]) != (H, W):
+        T = frames.shape[0]
+        resized = np.empty((T, H, W, 3), dtype=np.uint8)
+        for i in range(T):
+            im = Image.fromarray(frames[i]).resize((W, H), resample=Image.BILINEAR)
+            resized[i] = np.array(im, dtype=np.uint8)
+        frames = resized
+
+    return frames.astype(np.uint8)
 
 
 def _save_buffer_to_zarr(buffer: ReplayBuffer, zarr_path: str) -> None:
@@ -273,11 +278,11 @@ def main() -> None:
         action = load_action_array(run_dir)
         T_action = action.shape[0]
 
-        # List camera frames.
-        cam0_paths = list_camera_frames(run_dir, "rgb_cam0")
-        cam1_paths = list_camera_frames(run_dir, "rgb_cam1")
-        T_cam0 = len(cam0_paths)
-        T_cam1 = len(cam1_paths)
+        # Decode video frames.
+        img_cam0 = load_video_frames(run_dir, "cam0", resize_hw=resize_hw)
+        img_cam1 = load_video_frames(run_dir, "cam1", resize_hw=resize_hw)
+        T_cam0 = img_cam0.shape[0]
+        T_cam1 = img_cam1.shape[0]
 
         if args.allow_truncate:
             T = min(T_action, T_cam0, T_cam1)
@@ -287,11 +292,11 @@ def main() -> None:
                 print(
                     f"[WARN] Length mismatch in {run_name}: "
                     f"action={T_action}, cam0={T_cam0}, cam1={T_cam1}. "
-                    f"Truncating all to {T}."
+                    f"Subsampling all to {T} steps (evenly spaced)."
                 )
-            action = action[:T]
-            cam0_paths = cam0_paths[:T]
-            cam1_paths = cam1_paths[:T]
+            action = subsample_to_length(action, T)
+            img_cam0 = subsample_to_length(img_cam0, T)
+            img_cam1 = subsample_to_length(img_cam1, T)
         else:
             if not (T_action == T_cam0 == T_cam1):
                 raise RuntimeError(
@@ -300,9 +305,6 @@ def main() -> None:
                     f"Use --allow_truncate to truncate to the minimum length."
                 )
             T = T_action
-
-        img_cam0 = load_frames(cam0_paths, resize_hw=resize_hw)
-        img_cam1 = load_frames(cam1_paths, resize_hw=resize_hw)
 
         episode_data = {
             "img_cam0": img_cam0,
