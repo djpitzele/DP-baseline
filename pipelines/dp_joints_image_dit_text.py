@@ -89,7 +89,7 @@ class MultiImageAndTextCondition(BaseNNCondition):
     Condition that combines image observations (MultiImageObsCondition) with a
     text embedding. Expects condition dict to contain image keys
     (e.g. image_cam0, image_cam1).
-    Output shape matches the image-only embedding dim so it plugs into DiT.
+    Output shape is the concatenation of image and text feature dims.
     """
 
     def __init__(
@@ -120,14 +120,17 @@ class MultiImageAndTextCondition(BaseNNCondition):
         # Don't mutate caller's dict
         cond_copy = dict(condition)
         image_emb = self.image_condition(cond_copy, mask)  # (B, image_emb_dim)
-        if self._text_emb is None:
-            return image_emb
 
         B = image_emb.shape[0]
-        text_emb = self._text_emb.to(image_emb.device)  # (1, hidden_dim)
-        text_emb = self.text_proj(text_emb)  # (1, image_emb_dim)
-        text_emb = text_emb.expand(B, -1)  # (B, image_emb_dim)
-        return image_emb + text_emb
+        if self._text_emb is None:
+            # Keep output width stable even when text embedding has not been set.
+            text_emb = torch.zeros(B, self.image_emb_dim, device=image_emb.device, dtype=image_emb.dtype)
+        else:
+            text_emb = self._text_emb.to(image_emb.device)  # (1, hidden_dim)
+            text_emb = self.text_proj(text_emb)  # (1, image_emb_dim)
+            text_emb = text_emb.expand(B, -1)  # (B, image_emb_dim)
+
+        return torch.cat([image_emb, text_emb], dim=-1)
 
 
 @hydra.main(config_path="../configs/dp/joints/dit", config_name="joints_image_dit_text")
@@ -166,7 +169,8 @@ def pipeline(args):
     T5_MODEL_NAME = t5_model_name
     T5_MAX_LENGTH = t5_max_length
 
-    image_emb_dim = 256 * args.obs_steps  # same as vanilla DiT condition size
+    image_emb_dim = 256 * args.obs_steps
+    condition_emb_dim = image_emb_dim * 2  # image-text concatenation
 
     from cleandiffuser.nn_condition import MultiImageObsCondition
     from cleandiffuser.nn_diffusion import DiT1d
@@ -195,7 +199,7 @@ def pipeline(args):
 
     nn_diffusion = DiT1d(
         args.action_dim,
-        emb_dim=image_emb_dim,
+        emb_dim=condition_emb_dim,
         d_model=320,
         n_heads=10,
         depth=2,
