@@ -29,6 +29,9 @@ Camera mapping (from original LIBERO conventions):
     observation.images.image2  (eye-in-hand / wrist)    -> img_cam0
     observation.images.image   (agentview / environment) -> img_cam1
 
+Memory-efficient: episodes are flushed to the on-disk zarr one at a time
+so the full dataset never needs to fit in RAM.
+
 Example usage (run from DP-baseline root):
 
     python scripts/convert_libero_to_zarr.py \
@@ -40,6 +43,7 @@ Requires: pandas, pyarrow, imageio[ffmpeg], Pillow, zarr, numpy
 """
 
 import argparse
+import gc
 import json
 import os
 import shutil
@@ -58,7 +62,7 @@ import zarr
 from cleandiffuser.dataset.replay_buffer import ReplayBuffer
 
 try:
-    ZARR_V3 = hasattr(zarr, "storage")
+    ZARR_V3 = hasattr(zarr.storage, "LocalStore")
 except Exception:
     ZARR_V3 = False
 
@@ -221,45 +225,25 @@ def load_task_descriptions(input_path: str) -> Dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
-# Zarr writing (mirrors convert_push_to_zarr.py)
+# Episode flushing helper
 # ---------------------------------------------------------------------------
 
-def save_buffer_to_zarr(
-    buffer: ReplayBuffer,
-    zarr_path: str,
-    task_descriptions: Dict[int, str],
+def flush_episode(
+    replay_buffer: ReplayBuffer,
+    ep_data: Dict[str, list],
 ) -> None:
-    """Write buffer and task metadata to zarr on disk."""
-    path = os.path.expanduser(zarr_path)
-    if ZARR_V3:
-        store = zarr.storage.LocalStore(path)
-        root = zarr.open_group(store, mode="w")
-        meta = root.create_group("meta")
-        data_grp = root.create_group("data")
-        ep = buffer.episode_ends[:]
-        meta.create_array("episode_ends", shape=ep.shape, dtype=ep.dtype)[...] = ep
-        for key in buffer.keys():
-            arr = buffer[key][:]
-            chunk_len = min(100, max(1, arr.shape[0] // 10))
-            chunks = (chunk_len,) + arr.shape[1:]
-            z = data_grp.create_array(
-                key, shape=arr.shape, dtype=arr.dtype, chunks=chunks
-            )
-            z[...] = arr
-    else:
-        store = zarr.DirectoryStore(path)
-        root = zarr.group(store=store)
-        meta = root.require_group("meta")
-        meta.array("episode_ends", data=buffer.episode_ends[:], overwrite=True)
-        data_grp = root.require_group("data")
-        for key in buffer.keys():
-            arr = buffer[key][:]
-            chunk_len = min(100, max(1, arr.shape[0] // 10))
-            chunks = (chunk_len,) + arr.shape[1:]
-            data_grp.array(key, data=arr, chunks=chunks, overwrite=True)
+    """Stack accumulated per-step lists into arrays and write one episode."""
+    episode = {
+        "img_cam0": np.stack(ep_data["img_cam0"]),
+        "img_cam1": np.stack(ep_data["img_cam1"]),
+        "action": np.stack(ep_data["action"]),
+        "task_index": np.array(ep_data["task_index"], dtype=np.int64),
+    }
+    replay_buffer.add_episode(episode)
 
-    if task_descriptions:
-        root.attrs["task_descriptions"] = json.dumps(task_descriptions)
+
+def _new_accum() -> Dict[str, list]:
+    return {"img_cam0": [], "img_cam1": [], "action": [], "task_index": []}
 
 
 # ---------------------------------------------------------------------------
@@ -272,14 +256,17 @@ def process_video_format(
     resize_hw: Tuple[int, int],
     task_filter: Optional[set],
     max_episodes: Optional[int],
-) -> Tuple[ReplayBuffer, set]:
-    """Process data when images are stored in video files."""
-    replay_buffer = ReplayBuffer.create_empty_numpy()
+    replay_buffer: ReplayBuffer,
+) -> Tuple[set, int]:
+    """Process data when images are stored in video files.
+
+    Episodes are flushed to the on-disk zarr one at a time so that the
+    full dataset never needs to reside in RAM simultaneously.
+    """
     seen_tasks: set = set()
     episodes_added = 0
-
-    episode_accum: Dict[int, Dict[str, list]] = {}
-    episode_order: List[int] = []
+    cur_ep_idx: Optional[int] = None
+    cur_ep_data: Optional[Dict[str, list]] = None
 
     for file_idx, pf in enumerate(parquet_files):
         print(f"[INFO] Reading parquet file {file_idx + 1}/{len(parquet_files)}: "
@@ -315,49 +302,46 @@ def process_video_format(
             ep_idx = int(row["episode_index"])
             t_idx = int(row["task_index"])
 
+            if cur_ep_idx is not None and ep_idx != cur_ep_idx:
+                if cur_ep_data and cur_ep_data["img_cam0"]:
+                    seen_tasks.add(cur_ep_data["task_index"][0])
+                    flush_episode(replay_buffer, cur_ep_data)
+                    episodes_added += 1
+                    if episodes_added == 1 or episodes_added % 50 == 0:
+                        print(f"[INFO] Flushed {episodes_added} episodes to disk")
+                cur_ep_data = None
+                cur_ep_idx = None
+
             if task_filter is not None and t_idx not in task_filter:
                 continue
 
-            if ep_idx not in episode_accum:
-                episode_accum[ep_idx] = {
-                    "img_cam0": [], "img_cam1": [],
-                    "action": [], "task_index": [],
-                }
-                episode_order.append(ep_idx)
+            if max_episodes is not None and episodes_added >= max_episodes:
+                break
 
-            episode_accum[ep_idx]["img_cam0"].append(wrist_frames[local_idx])
-            episode_accum[ep_idx]["img_cam1"].append(env_frames[local_idx])
-            episode_accum[ep_idx]["action"].append(
+            if cur_ep_data is None:
+                cur_ep_data = _new_accum()
+                cur_ep_idx = ep_idx
+
+            cur_ep_data["img_cam0"].append(wrist_frames[local_idx])
+            cur_ep_data["img_cam1"].append(env_frames[local_idx])
+            cur_ep_data["action"].append(
                 np.array(row["action"], dtype=np.float32)
             )
-            episode_accum[ep_idx]["task_index"].append(t_idx)
+            cur_ep_data["task_index"].append(t_idx)
 
-    for ep_idx in episode_order:
+        del wrist_frames, env_frames, df
+        gc.collect()
+
         if max_episodes is not None and episodes_added >= max_episodes:
             break
-        buf = episode_accum[ep_idx]
-        if not buf["img_cam0"]:
-            continue
 
-        t_idx = buf["task_index"][0]
-        seen_tasks.add(t_idx)
+    if cur_ep_data and cur_ep_data["img_cam0"]:
+        if max_episodes is None or episodes_added < max_episodes:
+            seen_tasks.add(cur_ep_data["task_index"][0])
+            flush_episode(replay_buffer, cur_ep_data)
+            episodes_added += 1
 
-        episode_data = {
-            "img_cam0": np.stack(buf["img_cam0"]),
-            "img_cam1": np.stack(buf["img_cam1"]),
-            "action": np.stack(buf["action"]),
-            "task_index": np.array(buf["task_index"], dtype=np.int64),
-        }
-        replay_buffer.add_episode(episode_data)
-        episodes_added += 1
-
-        if episodes_added % 50 == 0 or episodes_added == 1:
-            print(f"[INFO] Added episode {episodes_added} "
-                  f"(ep_idx={ep_idx}, task={t_idx}, "
-                  f"steps={len(buf['img_cam0'])})")
-
-    del episode_accum
-    return replay_buffer, seen_tasks
+    return seen_tasks, episodes_added
 
 
 def process_inline_format(
@@ -365,14 +349,16 @@ def process_inline_format(
     resize_hw: Tuple[int, int],
     task_filter: Optional[set],
     max_episodes: Optional[int],
-) -> Tuple[ReplayBuffer, set]:
-    """Process data when images are embedded inline in the parquet files."""
-    replay_buffer = ReplayBuffer.create_empty_numpy()
+    replay_buffer: ReplayBuffer,
+) -> Tuple[set, int]:
+    """Process data when images are embedded inline in the parquet files.
+
+    Episodes are flushed to the on-disk zarr one at a time.
+    """
     seen_tasks: set = set()
     episodes_added = 0
-
-    episode_accum: Dict[int, Dict[str, list]] = {}
-    episode_order: List[int] = []
+    cur_ep_idx: Optional[int] = None
+    cur_ep_data: Optional[Dict[str, list]] = None
 
     for file_idx, pf in enumerate(parquet_files):
         print(f"[INFO] Reading parquet file {file_idx + 1}/{len(parquet_files)}: "
@@ -394,56 +380,53 @@ def process_inline_format(
             ep_idx = int(row["episode_index"])
             t_idx = int(row["task_index"])
 
+            if cur_ep_idx is not None and ep_idx != cur_ep_idx:
+                if cur_ep_data and cur_ep_data["img_cam0"]:
+                    seen_tasks.add(cur_ep_data["task_index"][0])
+                    flush_episode(replay_buffer, cur_ep_data)
+                    episodes_added += 1
+                    if episodes_added == 1 or episodes_added % 50 == 0:
+                        print(f"[INFO] Flushed {episodes_added} episodes to disk")
+                cur_ep_data = None
+                cur_ep_idx = None
+
             if task_filter is not None and t_idx not in task_filter:
                 continue
 
-            if ep_idx not in episode_accum:
-                episode_accum[ep_idx] = {
-                    "img_cam0": [], "img_cam1": [],
-                    "action": [], "task_index": [],
-                }
-                episode_order.append(ep_idx)
+            if max_episodes is not None and episodes_added >= max_episodes:
+                break
+
+            if cur_ep_data is None:
+                cur_ep_data = _new_accum()
+                cur_ep_idx = ep_idx
 
             wrist_img = decode_image_from_parquet(row[WRIST_IMAGE_KEY])
             env_img = decode_image_from_parquet(row[ENV_IMAGE_KEY])
 
-            episode_accum[ep_idx]["img_cam0"].append(
+            cur_ep_data["img_cam0"].append(
                 resize_image(wrist_img, resize_hw)
             )
-            episode_accum[ep_idx]["img_cam1"].append(
+            cur_ep_data["img_cam1"].append(
                 resize_image(env_img, resize_hw)
             )
-            episode_accum[ep_idx]["action"].append(
+            cur_ep_data["action"].append(
                 np.array(row["action"], dtype=np.float32)
             )
-            episode_accum[ep_idx]["task_index"].append(t_idx)
+            cur_ep_data["task_index"].append(t_idx)
 
-    for ep_idx in episode_order:
+        del df
+        gc.collect()
+
         if max_episodes is not None and episodes_added >= max_episodes:
             break
-        buf = episode_accum[ep_idx]
-        if not buf["img_cam0"]:
-            continue
 
-        t_idx = buf["task_index"][0]
-        seen_tasks.add(t_idx)
+    if cur_ep_data and cur_ep_data["img_cam0"]:
+        if max_episodes is None or episodes_added < max_episodes:
+            seen_tasks.add(cur_ep_data["task_index"][0])
+            flush_episode(replay_buffer, cur_ep_data)
+            episodes_added += 1
 
-        episode_data = {
-            "img_cam0": np.stack(buf["img_cam0"]),
-            "img_cam1": np.stack(buf["img_cam1"]),
-            "action": np.stack(buf["action"]),
-            "task_index": np.array(buf["task_index"], dtype=np.int64),
-        }
-        replay_buffer.add_episode(episode_data)
-        episodes_added += 1
-
-        if episodes_added % 50 == 0 or episodes_added == 1:
-            print(f"[INFO] Added episode {episodes_added} "
-                  f"(ep_idx={ep_idx}, task={t_idx}, "
-                  f"steps={len(buf['img_cam0'])})")
-
-    del episode_accum
-    return replay_buffer, seen_tasks
+    return seen_tasks, episodes_added
 
 
 def main() -> None:
@@ -477,13 +460,23 @@ def main() -> None:
     fmt = detect_format(input_path)
     print(f"[INFO] Detected data format: {fmt}")
 
+    # Create on-disk zarr so episodes stream to disk incrementally.
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if ZARR_V3:
+        store = zarr.storage.LocalStore(output_path)
+    else:
+        store = zarr.DirectoryStore(output_path)
+    replay_buffer = ReplayBuffer.create_empty_zarr(storage=store)
+
     if fmt == "video":
-        replay_buffer, seen_tasks = process_video_format(
-            input_path, parquet_files, resize_hw, task_filter, args.max_episodes,
+        seen_tasks, episodes_added = process_video_format(
+            input_path, parquet_files, resize_hw, task_filter,
+            args.max_episodes, replay_buffer,
         )
     else:
-        replay_buffer, seen_tasks = process_inline_format(
-            parquet_files, resize_hw, task_filter, args.max_episodes,
+        seen_tasks, episodes_added = process_inline_format(
+            parquet_files, resize_hw, task_filter,
+            args.max_episodes, replay_buffer,
         )
 
     if replay_buffer.n_episodes == 0:
@@ -496,9 +489,10 @@ def main() -> None:
     relevant_descriptions = {
         k: v for k, v in task_descriptions.items() if k in seen_tasks
     }
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    save_buffer_to_zarr(replay_buffer, output_path, relevant_descriptions)
+    if relevant_descriptions:
+        replay_buffer.root.attrs["task_descriptions"] = json.dumps(
+            relevant_descriptions
+        )
 
     # ------------------------------------------------------------------
     # Validation
