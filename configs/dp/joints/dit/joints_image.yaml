@@ -9,10 +9,10 @@ obs_keys: ['img_cam0', 'img_cam1', 'action']
 shape_meta:
   obs:
     image_cam0:
-      shape: [3, 96, 96]
+      shape: [3, 256, 256]
       type: rgb
     image_cam1:
-      shape: [3, 96, 96]
+      shape: [3, 256, 256]
       type: rgb
 action_dim: 8
 obs_steps: 2
@@ -27,7 +27,7 @@ image_augmentations:
     hue: 0.1
 # obs_encoder (input images resized/cropped to match)
 rgb_model: resnet18
-resize_shape: [96, 96]
+resize_shape: [256, 256]
 crop_shape: [84, 84]
 random_crop: true
 use_group_norm: true

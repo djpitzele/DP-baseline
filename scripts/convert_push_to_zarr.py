@@ -77,10 +77,10 @@ def parse_args() -> argparse.Namespace:
         "--resize_hw",
         type=int,
         nargs=2,
-        default=(96, 96),
+        default=(256, 256),
         metavar=("H", "W"),
         help="Resize images to (H, W) before writing to zarr. "
-        "Defaults to 96 96 to match joints_image shape_meta.",
+        "Defaults to 256 256 to match joints_image shape_meta.",
     )
     parser.add_argument(
         "--max_episodes",

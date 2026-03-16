@@ -88,9 +88,9 @@ def parse_args() -> argparse.Namespace:
         "--resize_hw",
         type=int,
         nargs=2,
-        default=(96, 96),
+        default=(256, 256),
         metavar=("H", "W"),
-        help="Resize images to (H, W). Defaults to 96 96.",
+        help="Resize images to (H, W). Defaults to 256 256.",
     )
     parser.add_argument(
         "--max_episodes",
