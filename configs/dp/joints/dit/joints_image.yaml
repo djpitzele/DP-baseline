@@ -28,8 +28,8 @@ image_augmentations:
 # obs_encoder (input images resized/cropped to match)
 rgb_model: resnet18
 resize_shape: [256, 256]
-crop_shape: [84, 84]
-random_crop: true
+crop_shape: [256, 256]
+random_crop: false
 use_group_norm: true
 use_seq: true
 # train
