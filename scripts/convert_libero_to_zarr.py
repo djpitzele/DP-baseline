@@ -203,7 +203,11 @@ def parquet_to_video_path(
 # ---------------------------------------------------------------------------
 
 def load_task_descriptions(input_path: str) -> Dict[int, str]:
-    """Load task_index -> description mapping from meta/tasks.parquet."""
+    """Load task_index -> description mapping from meta/tasks.parquet.
+
+    In the LeRobot LIBERO format the task text is stored as the DataFrame
+    *index* and the numeric task_index is a column.
+    """
     tasks_path = os.path.join(input_path, "meta", "tasks.parquet")
     if not os.path.isfile(tasks_path):
         print(f"[WARN] tasks.parquet not found at {tasks_path}; "
@@ -211,8 +215,8 @@ def load_task_descriptions(input_path: str) -> Dict[int, str]:
         return {}
     tasks_df = pd.read_parquet(tasks_path)
     mapping = {}
-    for _, row in tasks_df.iterrows():
-        mapping[int(row["task_index"])] = str(row["task"])
+    for description, row in tasks_df.iterrows():
+        mapping[int(row["task_index"])] = str(description)
     return mapping
 
 
